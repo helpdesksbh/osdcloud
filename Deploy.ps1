@@ -15,6 +15,7 @@ $Global:MyOSDCloud = [ordered]@{
     WindowsUpdate         = [bool]$true
     WindowsUpdateDrivers  = [bool]$true
     WindowsDefenderUpdate = [bool]$true
+    Restart               = [bool]$true
 }
 
 if ($Wim) {
