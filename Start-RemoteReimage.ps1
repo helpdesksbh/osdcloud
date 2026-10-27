@@ -4,10 +4,18 @@ $WimUrl = 'https://github.com/helpdesksbh/osdcloud/releases/latest/download/boot
 $SdiUrl = 'https://github.com/helpdesksbh/osdcloud/releases/latest/download/boot.sdi'
 $Dir    = 'C:\OSDCloud-Boot'
 
+# Safety check: don't reimage a device that was just reimaged.
+# To override (for testing), set OSDCLOUD_FORCE=1 before running.
 $Installed = (Get-CimInstance Win32_OperatingSystem).InstallDate
 if ($Installed -gt (Get-Date).AddHours(-24)) {
-    Write-Output 'Windows was installed in the last 24 hours. Skipping to prevent a reimage loop.'
-    exit 0
+    if ($env:OSDCLOUD_FORCE -eq '1') {
+        Write-Output 'Windows was installed in the last 24 hours, but OSDCLOUD_FORCE=1 is set. Continuing.'
+    }
+    else {
+        Write-Output 'Windows was installed in the last 24 hours. Skipping to prevent a reimage loop.'
+        Write-Output 'To override for testing, see "Override the 24-hour check" in the OSDCloud Web and GitHub Maintenance Guide.'
+        exit 0
+    }
 }
 
 New-Item -Path $Dir -ItemType Directory -Force | Out-Null
