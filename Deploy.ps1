@@ -93,6 +93,43 @@ if ($IsLaptop) {
     catch { Add-Line 'Camera: could not check' }
 }
 
+# Network
+try {
+    $Adapters = Get-CimInstance Win32_NetworkAdapter -Filter 'PhysicalAdapter=True' -ErrorAction Stop
+    $Wired    = $Adapters | Where-Object { $_.Name -notmatch 'Wi-?Fi|Wireless|WLAN|802\.11|Bluetooth' }
+    foreach ($A in $Adapters) {
+        $State = if ($A.NetConnectionStatus -eq 2) { 'connected' } else { 'not connected' }
+        $Speed = if ($A.Speed) { ', {0} Mbps' -f [math]::Round($A.Speed / 1MB) } else { '' }
+        Add-Line "Network: $($A.Name) ($State$Speed)"
+    }
+    if (-not $IsLaptop -and -not $Wired) { Add-Flag 'No wired network adapter detected on a desktop.' }
+}
+catch { Add-Line 'Network: could not list adapters' }
+
+if ($IsLaptop) {
+    # Wi-Fi hardware shows up even without a WinPE driver (PCI class 0280 = wireless network controller)
+    $WiFi = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match 'Wi-?Fi|Wireless|WLAN|802\.11' -or ($_.HardwareID -match 'CC_0280')
+    }
+    if ($WiFi) { Add-Line 'Wi-Fi:  adapter detected' }
+    else { Add-Flag 'No Wi-Fi adapter detected.' }
+}
+
+# Internet: can this laptop reach the sites the reimage downloads from?
+function Test-Site {
+    param([string]$Url)
+    try { Invoke-WebRequest -Uri $Url -Method Head -UseBasicParsing -TimeoutSec 15 | Out-Null; return $true }
+    catch { return [bool]$_.Exception.Response }   # any HTTP answer (even an error code) means the site is reachable
+}
+$Sites = [ordered]@{ 'Microsoft (Windows download)' = 'https://www.microsoft.com' }
+if ($CS.Manufacturer -match 'Dell') { $Sites['Dell (driver downloads)'] = 'https://downloads.dell.com' }
+if ($CS.Manufacturer -match 'HP|Hewlett') { $Sites['HP (driver downloads)'] = 'https://ftp.hp.com' }
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+foreach ($Name in $Sites.Keys) {
+    if (Test-Site $Sites[$Name]) { Add-Line "Internet: $Name reachable" }
+    else { Add-Flag "Can't reach $Name ($($Sites[$Name])). The reimage will likely fail when it downloads files. Check the network or web filter." }
+}
+
 Write-Host '========================================================' -ForegroundColor Cyan
 
 # Save the report to the USB (if one is connected)
