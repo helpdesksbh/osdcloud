@@ -90,6 +90,212 @@ function global:Copy-Item {
     }
 }
 
+# ---------- Progress for DISM steps (apply image, add drivers) ----------
+# Runs dism.exe and turns its output into a progress bar.
+function global:Invoke-DismWithProgress {
+    param(
+        [string[]]$Arguments,
+        [string]$Activity
+    )
+    $ErrorActionPreference = 'Continue'
+    $ProgressPreference = 'Continue'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $Output = New-Object System.Collections.Generic.List[string]
+    $Failed = 0
+    & "$env:SystemRoot\System32\dism.exe" @Arguments 2>&1 | ForEach-Object {
+        $Line = "$_".Trim()
+        if (-not $Line) { return }
+        $Elapsed = '{0:hh\:mm\:ss}' -f $sw.Elapsed
+        if ($Line -match 'Found (\d+) driver package') {
+            Write-Host "  $Line"
+            $Output.Add($Line)
+        }
+        elseif ($Line -match 'Installing (\d+) of (\d+)') {
+            $Current = [int]$Matches[1]
+            $Total = [int]$Matches[2]
+            $Pct = [int](($Current / [math]::Max($Total, 1)) * 100)
+            $Eta = -1
+            if ($Current -gt 1) { $Eta = [int]($sw.Elapsed.TotalSeconds / ($Current - 1) * ($Total - $Current + 1)) }
+            $Inf = ''
+            if ($Line -match ' - (.+?\.inf)') { $Inf = Split-Path $Matches[1] -Leaf }
+            Write-Progress -Activity $Activity -Status ("Driver {0} of {1} - elapsed {2}" -f $Current, $Total, $Elapsed) -CurrentOperation $Inf -PercentComplete $Pct -SecondsRemaining $Eta
+            if ($Line -notmatch 'successfully') {
+                $Failed++
+                Write-Host "  $Line" -ForegroundColor Yellow
+            }
+        }
+        elseif ($Line -match '(\d{1,3}(?:\.\d+)?)%') {
+            $Pct = [double]$Matches[1]
+            $Eta = -1
+            if ($Pct -ge 1) { $Eta = [int]($sw.Elapsed.TotalSeconds * (100 - $Pct) / $Pct) }
+            Write-Progress -Activity $Activity -Status ("{0:N1}% - elapsed {1}" -f $Pct, $Elapsed) -PercentComplete ([int][math]::Min($Pct, 100)) -SecondsRemaining $Eta
+        }
+        else {
+            $Output.Add($Line)
+        }
+    }
+    $Code = $LASTEXITCODE
+    Write-Progress -Activity $Activity -Completed
+    [pscustomobject]@{
+        ExitCode = $Code
+        Output   = $Output
+        Elapsed  = $sw.Elapsed
+        Failed   = $Failed
+    }
+}
+
+# OSDCloud applies the Windows image with Expand-WindowsImage.
+# This version runs the same apply through dism.exe so it can show a progress bar.
+function global:Expand-WindowsImage {
+    [CmdletBinding()]
+    param(
+        [string]$ApplyPath,
+        [string]$ImagePath,
+        [uint32]$Index,
+        [string]$Name,
+        [string]$ScratchDirectory,
+        [string]$SplitImageFilePattern,
+        [switch]$CheckIntegrity,
+        [switch]$Verify,
+        [switch]$NoRpFix,
+        [switch]$ConfirmTrustedFile,
+        [switch]$Compact,
+        [switch]$SupportEa,
+        [string]$LogPath,
+        [string]$LogLevel
+    )
+    if ($SplitImageFilePattern -or -not $ImagePath -or -not $ApplyPath -or (-not $Index -and -not $Name)) {
+        $ProgressPreference = 'Continue'
+        return Dism\Expand-WindowsImage @PSBoundParameters
+    }
+    $DismArgs = @('/Apply-Image', "/ImageFile:$ImagePath", "/ApplyDir:$ApplyPath")
+    if ($Index) { $DismArgs += "/Index:$Index" } else { $DismArgs += "/Name:$Name" }
+    if ($ScratchDirectory) {
+        New-Item -ItemType Directory -Path $ScratchDirectory -Force -ErrorAction SilentlyContinue | Out-Null
+        $DismArgs += "/ScratchDir:$ScratchDirectory"
+    }
+    if ($CheckIntegrity)     { $DismArgs += '/CheckIntegrity' }
+    if ($Verify)             { $DismArgs += '/Verify' }
+    if ($NoRpFix)            { $DismArgs += '/NoRpFix' }
+    if ($ConfirmTrustedFile) { $DismArgs += '/ConfirmTrustedFile' }
+    if ($Compact)            { $DismArgs += '/Compact' }
+    if ($SupportEa)          { $DismArgs += '/EA' }
+    if ($LogPath)            { $DismArgs += "/LogPath:$LogPath" }
+    Write-Host "  Applying $(Split-Path $ImagePath -Leaf) to $ApplyPath"
+    $Result = Invoke-DismWithProgress -Arguments $DismArgs -Activity "Applying Windows image $(Split-Path $ImagePath -Leaf)"
+    if ($Result.ExitCode -ne 0) {
+        throw "DISM /Apply-Image failed with exit code $($Result.ExitCode). $(($Result.Output | Select-Object -Last 3) -join ' ')"
+    }
+    Write-Host ("  Windows image applied in {0:mm\:ss}" -f $Result.Elapsed) -ForegroundColor Green
+}
+
+# OSDCloud adds the drivers in C:\Drivers with Use-WindowsUnattend (offline servicing),
+# which shows nothing for up to 20 minutes. When the unattend file only lists driver folders,
+# this version adds the same folders with dism.exe /Add-Driver /Recurse, which reports
+# each driver, so the bar shows "Driver X of Y". Any other unattend file is passed through unchanged.
+function global:Use-WindowsUnattend {
+    [CmdletBinding()]
+    param(
+        [string]$Path,
+        [string]$UnattendPath,
+        [switch]$Online,
+        [switch]$NoRestart,
+        [string]$SystemDrive,
+        [string]$WindowsDirectory,
+        [string]$ScratchDirectory,
+        [string]$LogPath,
+        [string]$LogLevel
+    )
+    $DriverPaths = @()
+    if ($Path -and -not $Online -and $UnattendPath -and (Test-Path -LiteralPath $UnattendPath)) {
+        try {
+            [xml]$Xml = Get-Content -LiteralPath $UnattendPath -Raw
+            $Passes = @($Xml.unattend.settings)
+            if ($Passes.Count -eq 1 -and $Passes[0].pass -eq 'offlineServicing') {
+                $Components = @($Passes[0].component)
+                $Other = $Components | Where-Object { $_.name -ne 'Microsoft-Windows-PnpCustomizationsNonWinPE' }
+                if (-not $Other) {
+                    $DriverPaths = @($Components | ForEach-Object { $_.DriverPaths.PathAndCredentials | ForEach-Object { $_.Path } } |
+                        Where-Object { $_ } | Select-Object -Unique)
+                }
+            }
+        }
+        catch { $DriverPaths = @() }
+    }
+    if ($DriverPaths.Count -eq 0) {
+        $ProgressPreference = 'Continue'
+        return Dism\Use-WindowsUnattend @PSBoundParameters
+    }
+    foreach ($DriverPath in $DriverPaths) {
+        if (-not (Test-Path -LiteralPath $DriverPath)) {
+            Write-Host "  Driver folder $DriverPath not found. Skipping."
+            continue
+        }
+        $InfCount = (Get-ChildItem -LiteralPath $DriverPath -Filter *.inf -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
+        Write-Host "  Adding drivers from $DriverPath ($InfCount .inf files)"
+        $DismArgs = @("/Image:$Path", '/Add-Driver', "/Driver:$DriverPath", '/Recurse')
+        if ($ScratchDirectory) { $DismArgs += "/ScratchDir:$ScratchDirectory" }
+        $Result = Invoke-DismWithProgress -Arguments $DismArgs -Activity 'Adding drivers to Windows'
+        if ($Result.ExitCode -ne 0 -or $Result.Failed -gt 0) {
+            Write-Warning "DISM /Add-Driver finished with exit code $($Result.ExitCode) and $($Result.Failed) driver(s) not added. Windows Update will fill most gaps after setup."
+        }
+        Write-Host ("  Drivers added in {0:mm\:ss}" -f $Result.Elapsed) -ForegroundColor Green
+    }
+}
+
+# ---------- Progress for expanding Dell driver packs ----------
+# OSDCloud expands Dell packs with Start-Process <pack>.exe /s /e=<folder> -Wait.
+# Dell packs don't report their size ahead of time, so this shows MB extracted and time elapsed.
+# Every other Start-Process call is passed through unchanged.
+function global:Start-Process {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        [Alias('PSPath', 'Path')]
+        [string]$FilePath,
+        [Parameter(Position = 1)]
+        [Alias('Args')]
+        [string[]]$ArgumentList,
+        [string]$WorkingDirectory,
+        [switch]$Wait,
+        [switch]$NoNewWindow,
+        [switch]$PassThru,
+        [string]$RedirectStandardOutput,
+        [string]$RedirectStandardError,
+        [string]$RedirectStandardInput,
+        [System.Diagnostics.ProcessWindowStyle]$WindowStyle,
+        [string]$Verb,
+        [switch]$UseNewEnvironment,
+        [switch]$LoadUserProfile,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    $ArgText = "$ArgumentList"
+    $Watch = $Wait -and $FilePath -match '\.exe$' -and $ArgText -match '/s\b' -and $ArgText -match '/e="?([^"]+)"?'
+    if (-not $Watch) {
+        return Microsoft.PowerShell.Management\Start-Process @PSBoundParameters
+    }
+    $Folder = $Matches[1].Trim()
+    $ProgressPreference = 'Continue'
+    $Params = @{} + $PSBoundParameters
+    $null = $Params.Remove('Wait')
+    $Params['PassThru'] = $true
+    $Proc = Microsoft.PowerShell.Management\Start-Process @Params
+    $Activity = "Expanding $(Split-Path $FilePath -Leaf)"
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while (-not $Proc.HasExited) {
+        $MB = 0
+        if (Test-Path -LiteralPath $Folder) {
+            $MB = ((Get-ChildItem -LiteralPath $Folder -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum) / 1MB
+        }
+        Write-Progress -Activity $Activity -Status ("{0:N0} MB extracted - elapsed {1:hh\:mm\:ss}" -f $MB, $sw.Elapsed)
+        Start-Sleep -Seconds 3
+    }
+    $Proc.WaitForExit()
+    Write-Progress -Activity $Activity -Completed
+    Write-Host ("  Expanded {0} in {1:mm\:ss}" -f (Split-Path $FilePath -Leaf), $sw.Elapsed) -ForegroundColor Green
+    if ($PassThru) { return $Proc }
+}
+
 # ---------- Hardware health check (runs before anything is wiped) ----------
 $Flags  = New-Object System.Collections.Generic.List[string]
 $Report = New-Object System.Collections.Generic.List[string]
