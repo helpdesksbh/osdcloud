@@ -5,17 +5,110 @@ $CurrentOS    = 'Windows 11 25H2 x64'
 $PilotOS      = 'Windows 11 26H2 x64'
 $PilotSerials = @()
 
-$MinBatteryPercent = 70    # flag batteries below this % of original capacity
+$MinBatteryPercent  = 70   # flag batteries below this % of original capacity
 $MaxDiskWearPercent = 80   # flag drives that have used this much of their rated life
-$MaxDiskTempC      = 70    # flag drives running hotter than this
-$MinMemoryGB       = 8     # flag less installed memory than this
+$MaxDiskTempC       = 70   # flag drives running hotter than this
+$MinMemoryGB        = 8    # flag less installed memory than this
+$global:ProgressMinSizeMB = 500  # show a progress bar for any file copy at least this large
 # ============================================
+
+# ---------- Progress bar for large file copies ----------
+# OSDCloud copies the USB image with Copy-Item, which shows no progress.
+# This function takes the place of Copy-Item for this session. Files at or above
+# $ProgressMinSizeMB are copied with a progress bar (percent, MB/s, time left).
+# Everything else is passed straight to the normal Copy-Item.
+function global:Copy-Item {
+    [CmdletBinding(DefaultParameterSetName = 'Path', SupportsShouldProcess)]
+    param(
+        [Parameter(ParameterSetName = 'Path', Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [string[]]$Path,
+        [Parameter(ParameterSetName = 'LiteralPath', ValueFromPipelineByPropertyName)]
+        [Alias('PSPath', 'LP')]
+        [string[]]$LiteralPath,
+        [Parameter(Position = 1)]
+        [string]$Destination,
+        [switch]$Container,
+        [switch]$Force,
+        [string]$Filter,
+        [string[]]$Include,
+        [string[]]$Exclude,
+        [switch]$Recurse,
+        [switch]$PassThru
+    )
+    process {
+        $ProgressPreference = 'Continue'
+        $src = $null
+        if ($Destination -and -not $Recurse -and -not $Filter -and -not $Include -and -not $Exclude) {
+            if ($LiteralPath -and $LiteralPath.Count -eq 1) {
+                $src = Microsoft.PowerShell.Management\Get-Item -LiteralPath $LiteralPath[0] -Force -ErrorAction SilentlyContinue
+            }
+            elseif ($Path -and $Path.Count -eq 1) {
+                $src = Microsoft.PowerShell.Management\Get-Item -Path $Path[0] -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if ($src -is [System.IO.FileInfo] -and $src.Length -ge ($global:ProgressMinSizeMB * 1MB)) {
+            $destFile = $Destination
+            if ((Test-Path -LiteralPath $Destination -PathType Container) -or $Destination.EndsWith('\')) {
+                $destFile = Join-Path $Destination $src.Name
+            }
+            $destDir = Split-Path $destFile -Parent
+            if ($destDir -and -not (Test-Path -LiteralPath $destDir)) {
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+            }
+            $activity = "Copying $($src.Name)"
+            $total = $src.Length
+            $buffer = New-Object byte[] (8MB)
+            $in = [System.IO.File]::OpenRead($src.FullName)
+            $out = [System.IO.File]::Create($destFile)
+            try {
+                $copied = 0
+                $last = 0
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                while (($read = $in.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $out.Write($buffer, 0, $read)
+                    $copied += $read
+                    if (($sw.ElapsedMilliseconds - $last) -ge 1000 -or $copied -eq $total) {
+                        $last = $sw.ElapsedMilliseconds
+                        $mbps = ($copied / 1MB) / [math]::Max($sw.Elapsed.TotalSeconds, 0.1)
+                        $eta = if ($mbps -gt 0) { [int](($total - $copied) / 1MB / $mbps) } else { -1 }
+                        $pct = [int](($copied / $total) * 100)
+                        $status = "{0}% - {1:N0} of {2:N0} MB - {3:N1} MB/s" -f $pct, ($copied / 1MB), ($total / 1MB), $mbps
+                        Write-Progress -Activity $activity -Status $status -PercentComplete $pct -SecondsRemaining $eta
+                    }
+                }
+            }
+            finally {
+                $in.Close()
+                $out.Close()
+            }
+            Write-Progress -Activity $activity -Completed
+            Write-Host ("Copied {0} ({1:N0} MB) in {2:mm\:ss}" -f $src.Name, ($total / 1MB), $sw.Elapsed) -ForegroundColor Green
+            if ($PassThru) { Microsoft.PowerShell.Management\Get-Item -LiteralPath $destFile }
+            return
+        }
+        Microsoft.PowerShell.Management\Copy-Item @PSBoundParameters
+    }
+}
 
 # ---------- Hardware health check (runs before anything is wiped) ----------
 $Flags  = New-Object System.Collections.Generic.List[string]
 $Report = New-Object System.Collections.Generic.List[string]
 function Add-Line { param([string]$Text) $Report.Add($Text); Write-Host "  $Text" }
 function Add-Flag { param([string]$Text) $Flags.Add($Text); $Report.Add("FLAG: $Text"); Write-Host "  FLAG: $Text" -ForegroundColor Red }
+
+function Save-HealthReport {
+    param([string]$Decision)
+    $UsbRoot = Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne 'X' -and (Test-Path "$($_.Root)OSDCloud") } |
+        Select-Object -First 1
+    if (-not $UsbRoot) { return }
+    $LogDir = "$($UsbRoot.Root)OSDCloud\Logs"
+    New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $File = Join-Path $LogDir ("Health-{0}-{1}.txt" -f $Serial, (Get-Date -Format 'yyyy-MM-dd-HHmm'))
+    $Lines = @("Hardware Health Check - $(Get-Date)") + $Report + @('', "Result: $Decision")
+    $Lines | Set-Content -Path $File -Encoding UTF8 -ErrorAction SilentlyContinue
+    Write-Host "  Report saved to $File"
+}
 
 Write-Host ''
 Write-Host '================ HARDWARE HEALTH CHECK ================' -ForegroundColor Cyan
@@ -42,7 +135,7 @@ catch { Add-Line 'Memory: could not check' }
 
 # Disk
 try {
-    $Disks = Get-PhysicalDisk -ErrorAction Stop | Where-Object { $_.BusType -notin 'USB', 'File Backed Virtual' }
+    $Disks = Get-PhysicalDisk -ErrorAction Stop | Where-Object { "$($_.BusType)" -notin 'USB', 'File Backed Virtual' }
     if (-not $Disks) { Add-Flag 'No internal disk detected.' }
     foreach ($Disk in $Disks) {
         $SizeGB = [math]::Round($Disk.Size / 1GB)
@@ -50,137 +143,99 @@ try {
         if ("$($Disk.HealthStatus)" -ne 'Healthy') { Add-Flag "Disk '$($Disk.FriendlyName)' reports health: $($Disk.HealthStatus)." }
         try {
             $Rel = $Disk | Get-StorageReliabilityCounter -ErrorAction Stop
-            Add-Line ("        wear: {0}%, temp: {1} C, uncorrected read errors: {2}" -f $Rel.Wear, $Rel.Temperature, $Rel.ReadErrorsUncorrected)
-            if ($Rel.Wear -ge $MaxDiskWearPercent) { Add-Flag "Disk has used $($Rel.Wear)% of its rated life." }
-            if ($Rel.Temperature -gt $MaxDiskTempC) { Add-Flag "Disk temperature is $($Rel.Temperature) C." }
-            if ($Rel.ReadErrorsUncorrected -gt 0) { Add-Flag "Disk has $($Rel.ReadErrorsUncorrected) uncorrected read errors." }
+            if ($null -ne $Rel.Wear) {
+                Add-Line "        Wear: $($Rel.Wear)% of rated life used"
+                if ($Rel.Wear -ge $MaxDiskWearPercent) { Add-Flag "Disk has used $($Rel.Wear)% of its rated life (limit $MaxDiskWearPercent%)." }
+            }
+            else { Add-Line '        Wear: could not check' }
+            if ($Rel.Temperature) {
+                Add-Line "        Temperature: $($Rel.Temperature) C"
+                if ($Rel.Temperature -gt $MaxDiskTempC) { Add-Flag "Disk is running at $($Rel.Temperature) C (limit $MaxDiskTempC C)." }
+            }
+            else { Add-Line '        Temperature: could not check' }
+            if ($null -ne $Rel.ReadErrorsUncorrected) {
+                Add-Line "        Uncorrected read errors: $($Rel.ReadErrorsUncorrected)"
+                if ($Rel.ReadErrorsUncorrected -gt 0) { Add-Flag "Disk has $($Rel.ReadErrorsUncorrected) uncorrected read errors." }
+            }
         }
-        catch { Add-Line '        wear/temperature/errors: not reported by this drive' }
+        catch { Add-Line '        Wear, temperature, errors: could not check' }
     }
 }
-catch { Add-Line 'Disk:   could not check (storage tools not available in this boot image)' }
+catch { Add-Line 'Disk:   could not check' }
 
 # Battery (laptops only)
 if ($IsLaptop) {
     try {
-        $Full   = (Get-CimInstance -Namespace root\wmi -ClassName BatteryFullChargedCapacity -ErrorAction Stop | Select-Object -First 1).FullChargedCapacity
-        $Design = (Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction Stop | Select-Object -First 1).DesignedCapacity
-        if ($Full -and $Design) {
-            $Pct = [math]::Round(($Full / $Design) * 100)
-            Add-Line "Battery: $Pct% of original capacity"
-            if ($Pct -lt $MinBatteryPercent) { Add-Flag "Battery is at $Pct% of its original capacity (threshold $MinBatteryPercent%)." }
+        $Design = Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction Stop
+        $Full   = Get-CimInstance -Namespace root\wmi -ClassName BatteryFullChargedCapacity -ErrorAction Stop
+        if (-not $Design -or -not $Full) {
+            Add-Flag 'No battery found.'
         }
-        else { Add-Line 'Battery: capacity not reported' }
+        else {
+            $DesignCap = ($Design | Measure-Object -Property DesignedCapacity -Sum).Sum
+            $FullCap   = ($Full | Measure-Object -Property FullChargedCapacity -Sum).Sum
+            if ($DesignCap -gt 0) {
+                $BattPct = [math]::Round(($FullCap / $DesignCap) * 100)
+                Add-Line "Battery: $BattPct% of original capacity"
+                if ($BattPct -lt $MinBatteryPercent) { Add-Flag "Battery holds only $BattPct% of its original capacity (limit $MinBatteryPercent%)." }
+            }
+            else { Add-Line 'Battery: could not check' }
+        }
     }
-    catch {
-        if (Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue) { Add-Line 'Battery: present, capacity not reported' }
-        else { Add-Flag 'No battery detected on a laptop.' }
-    }
+    catch { Add-Line 'Battery: could not check' }
 }
 
-# Camera (laptops only; detects the device, cannot show video in WinPE)
+# Camera (laptops only)
 if ($IsLaptop) {
     try {
-        $Cameras = Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
-            $_.PNPClass -in 'Camera', 'Image' -or
-            $_.Name -match 'camera|webcam' -or
-            ($_.CompatibleID -match 'USB\\Class_0E') -or
-            ($_.HardwareID -match 'USB\\Class_0E')
-        }
-        if ($Cameras) { Add-Line "Camera: detected ($(@($Cameras).Count) device(s))" }
-        else { Add-Flag 'No camera detected. Check the camera after Windows is installed (some newer cameras only show up once Windows drivers load).' }
+        $Cams = Get-CimInstance Win32_PnPEntity -ErrorAction Stop |
+            Where-Object { $_.PNPClass -in 'Camera', 'Image' -or $_.Name -match 'camera|webcam' }
+        if ($Cams) { Add-Line "Camera: $(($Cams | Select-Object -First 1).Name)" }
+        else { Add-Flag 'No camera detected.' }
     }
     catch { Add-Line 'Camera: could not check' }
 }
 
-# Network
-try {
-    $Adapters = Get-CimInstance Win32_NetworkAdapter -Filter 'PhysicalAdapter=True' -ErrorAction Stop
-    $Wired    = $Adapters | Where-Object { $_.Name -notmatch 'Wi-?Fi|Wireless|WLAN|802\.11|Bluetooth' }
-    foreach ($A in $Adapters) {
-        $State = if ($A.NetConnectionStatus -eq 2) { 'connected' } else { 'not connected' }
-        $Speed = if ($A.Speed) { ', {0} Mbps' -f [math]::Round($A.Speed / 1MB) } else { '' }
-        Add-Line "Network: $($A.Name) ($State$Speed)"
-    }
-    if (-not $IsLaptop -and -not $Wired) { Add-Flag 'No wired network adapter detected on a desktop.' }
-}
-catch { Add-Line 'Network: could not list adapters' }
-
-if ($IsLaptop) {
-    # Wi-Fi hardware shows up even without a WinPE driver (PCI class 0280 = wireless network controller)
-    $WiFi = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match 'Wi-?Fi|Wireless|WLAN|802\.11' -or ($_.HardwareID -match 'CC_0280')
-    }
-    if ($WiFi) { Add-Line 'Wi-Fi:  adapter detected' }
-    else { Add-Flag 'No Wi-Fi adapter detected.' }
-}
-
-# Internet: can this laptop reach the sites the reimage downloads from?
-function Test-Site {
-    param([string]$Url)
-    try { Invoke-WebRequest -Uri $Url -Method Head -UseBasicParsing -TimeoutSec 15 | Out-Null; return $true }
-    catch { return [bool]$_.Exception.Response }   # any HTTP answer (even an error code) means the site is reachable
-}
-$Sites = [ordered]@{ 'Microsoft (Windows download)' = 'https://www.microsoft.com' }
-if ($CS.Manufacturer -match 'Dell') { $Sites['Dell (driver downloads)'] = 'https://downloads.dell.com' }
-if ($CS.Manufacturer -match 'HP|Hewlett') { $Sites['HP (driver downloads)'] = 'https://ftp.hp.com' }
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-foreach ($Name in $Sites.Keys) {
-    if (Test-Site $Sites[$Name]) { Add-Line "Internet: $Name reachable" }
-    else { Add-Flag "Can't reach $Name ($($Sites[$Name])). The reimage will likely fail when it downloads files. Check the network or web filter." }
-}
-
-Write-Host '========================================================' -ForegroundColor Cyan
-
-# Save the report to the USB (if one is connected)
-$UsbRoot = Get-PSDrive -PSProvider FileSystem |
-    Where-Object { Test-Path "$($_.Root)OSDCloud" } |
-    Select-Object -First 1 -ExpandProperty Root
-if ($UsbRoot) {
-    try {
-        $LogDir = Join-Path $UsbRoot 'OSDCloud\Logs'
-        New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
-        $LogFile = Join-Path $LogDir ("Health-{0}-{1}.txt" -f $Serial, (Get-Date -Format 'yyyy-MM-dd_HHmm'))
-        $Report | Set-Content -Path $LogFile -Encoding UTF8
-        Write-Host "Report saved to $LogFile"
-    }
-    catch { Write-Host 'Could not save the report to the USB.' -ForegroundColor Yellow }
-}
-
-# Prompt the tech if anything was flagged
-if ($Flags.Count -gt 0) {
-    Write-Host ''
-    Write-Host "$($Flags.Count) problem(s) found. Nothing has been erased yet." -ForegroundColor Red
-    do {
-        $Answer = (Read-Host 'Type Y to continue and reimage anyway, or N to stop').Trim().ToUpper()
-    } until ($Answer -in 'Y', 'N')
-    if ($Answer -eq 'N') {
-        Write-Host ''
-        Write-Host 'Stopped. The laptop has NOT been wiped.' -ForegroundColor Yellow
-        Write-Host 'Note the problems in the Jitbit ticket. To go back to Windows, remove any USB and type: wpeutil reboot' -ForegroundColor Yellow
-        exit
-    }
-    Write-Host 'Continuing at the tech''s request.' -ForegroundColor Yellow
+# Result and tech prompt
+Write-Host ''
+if ($Flags.Count -eq 0) {
+    Write-Host '  No problems found. Continuing.' -ForegroundColor Green
+    Save-HealthReport -Decision 'No problems found. Reimage continued.'
 }
 else {
-    Write-Host 'No problems found. Continuing.' -ForegroundColor Green
+    Write-Host "  $($Flags.Count) problem(s) found. Nothing has been erased yet." -ForegroundColor Yellow
+    do {
+        $Answer = (Read-Host '  Type Y to continue and reimage anyway, or N to stop').Trim().ToUpper()
+    } until ($Answer -in 'Y', 'N')
+    if ($Answer -eq 'N') {
+        Save-HealthReport -Decision 'Problems found. Tech stopped the reimage.'
+        Write-Host ''
+        Write-Host '  Reimage stopped. Nothing was erased.' -ForegroundColor Yellow
+        Write-Host '  Note the problem in Jitbit, remove any USB, then type: wpeutil reboot' -ForegroundColor Yellow
+        exit
+    }
+    Save-HealthReport -Decision 'Problems found. Tech chose to continue.'
 }
+Write-Host '=======================================================' -ForegroundColor Cyan
+Write-Host ''
 
-# ---------- Deployment ----------
-$Serial = (Get-CimInstance Win32_BIOS).SerialNumber.Trim()
+# ---------- Pick the Windows version ----------
 if ($PilotSerials -contains $Serial) { $OS = $PilotOS } else { $OS = $CurrentOS }
 
+# ---------- Look for a patched image on the USB ----------
 $Wim = Get-PSDrive -PSProvider FileSystem |
     ForEach-Object { Get-ChildItem "$($_.Root)OSDCloud\OS" -Filter *.wim -ErrorAction SilentlyContinue } |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
+# ---------- OSDCloud options ----------
 $Global:MyOSDCloud = [ordered]@{
+    Restart               = [bool]$true
     WindowsUpdate         = [bool]$true
     WindowsUpdateDrivers  = [bool]$true
     WindowsDefenderUpdate = [bool]$true
-    Restart               = [bool]$true
 }
 
+# ---------- Start the install ----------
 if ($Wim) {
     Write-Host "Using USB image $($Wim.Name)"
     $Global:MyOSDCloud.ImageFileItem     = $Wim
